@@ -3,15 +3,15 @@ function restoreCanvasState(state) {
   if (!api) return;
 
   requestAnimationFrame(() => {
-    // 1. Mode first
+    // ── 1. Mode first ────────────────────────────────────────────────────────
     if (state.mode) api.setMode(state.mode);
 
-    // 2. Split immediately after
+    // ── 2. Split pct immediately after mode ──────────────────────────────────
     if (state.mode === 'is-split' && state.splitPct) {
       window.setSplitPct?.(state.splitPct);
     }
 
-    // 3. Zoom + pan in a nested RAF — must run AFTER applyMode's internal RAF resets zoom
+    // ── 3. Zoom + pan — nested RAFs, must run after applyMode's internal RAF ─
     requestAnimationFrame(() => {
       if (state.gameplayZoom) api.setGameplayZoom(state.gameplayZoom);
 
@@ -19,31 +19,30 @@ function restoreCanvasState(state) {
         if (state.gameplayPanX !== undefined && state.gameplayZoom >= 1) {
           const gpVideo = document.querySelector('[wized="stream_clip_video"]');
           const gpHold  = document.querySelector('.gameplay_hold');
-          if (!gpVideo || !gpHold) return;
-
-          const applyPan = () => {
-            const gpW  = gpVideo.offsetWidth;
-            const gpH  = gpVideo.offsetHeight;
-            const gpHW = gpHold.clientWidth;
-            const gpHH = gpHold.clientHeight;
-            gpVideo.style.left = `${Math.max(gpHW - gpW, Math.min(0, state.gameplayPanX * gpHW))}px`;
-            gpVideo.style.top  = `${Math.max(gpHH - gpH, Math.min(0, state.gameplayPanY * gpHH))}px`;
-          };
-
-          if (gpVideo.videoWidth) {
-            applyPan();
-          } else {
-            gpVideo.addEventListener('loadedmetadata', applyPan, { once: true });
+          if (gpVideo && gpHold) {
+            const applyPan = () => {
+              const gpW  = gpVideo.offsetWidth;
+              const gpH  = gpVideo.offsetHeight;
+              const gpHW = gpHold.clientWidth;
+              const gpHH = gpHold.clientHeight;
+              gpVideo.style.left = `${Math.max(gpHW - gpW, Math.min(0, state.gameplayPanX * gpHW))}px`;
+              gpVideo.style.top  = `${Math.max(gpHH - gpH, Math.min(0, state.gameplayPanY * gpHH))}px`;
+            };
+            if (gpVideo.videoWidth) {
+              applyPan();
+            } else {
+              gpVideo.addEventListener('loadedmetadata', applyPan, { once: true });
+            }
           }
         }
         window.dispatchEvent(new CustomEvent('canvasRestored'));
       });
     });
 
-    // 4. Facecam overlay position + size — only in overlay mode
+    // ── 4. Facecam overlay position + size (overlay mode only) ───────────────
     if (state.mode === 'is-overlay' && state.facecamW) {
-      const fw = document.querySelector('.clip_canvas')?.clientWidth  ?? 1;
-      const fh = document.querySelector('.clip_canvas')?.clientHeight ?? 1;
+      const fw     = document.querySelector('.clip_canvas')?.clientWidth  ?? 1;
+      const fh     = document.querySelector('.clip_canvas')?.clientHeight ?? 1;
       const fcHold = document.querySelector('.facecam_hold');
       if (fcHold) {
         fcHold.style.width  = `${state.facecamW * fw}px`;
@@ -54,7 +53,20 @@ function restoreCanvasState(state) {
       }
     }
 
-    // 5. Everything else
+    // ── 5. Tracks — master first so clamp runs before secondaries restore ────
+    if (state.tracks?.video) {
+      api.setMasterTrim(
+        state.tracks.video.trimIn  ?? 0,
+        state.tracks.video.trimOut ?? 0
+      );
+    }
+    if (state.tracks) {
+      Object.entries(state.tracks).forEach(([name, t]) => {
+        if (name !== 'video') api.setTrack(name, t);
+      });
+    }
+
+    // ── 6. Text, zones, toggles ──────────────────────────────────────────────
     if (state.title)                         api.setTitle(state.title);
     if (state.titleZone)                     api.setTitleZone(state.titleZone);
     if (state.subtitleZone)                  api.setSubtitleZone(state.subtitleZone);
@@ -63,31 +75,31 @@ function restoreCanvasState(state) {
     if (state.chatBlend)                     api.setChatBlend(state.chatBlend);
     if (state.facecamVisible  !== undefined) api.setFacecamVisible(state.facecamVisible);
 
-    // 6. Image — set src first, then visible, then scale+position after visible
+    // ── 7. Image — scale first, then position + visibility after double RAF ──
     const liveImageUrl = document.querySelector('[wized="stream_clip_image_url"]')?.textContent.trim();
     if (!liveImageUrl && state.imgSrc) api.setImage(state.imgSrc);
 
     if (state.imageScale) api.setImageScale(state.imageScale);
     requestAnimationFrame(() => {
       requestAnimationFrame(() => {
-        if (state.imageX !== undefined) api.setImagePosition(state.imageX, state.imageY);
+        if (state.imageX     !== undefined) api.setImagePosition(state.imageX, state.imageY);
         if (state.imageVisible !== undefined) api.setImageVisible(state.imageVisible);
       });
     });
 
-    // 7. Chat position + size
-   if (state.chatW) {
-    const fw = document.querySelector('.clip_canvas')?.clientWidth  ?? 1;
-    const fh = document.querySelector('.clip_canvas')?.clientHeight ?? 1;
-    const chatHold = document.querySelector('.chat_hold');
-    if (chatHold) {
-      chatHold.style.width  = `${state.chatW * fw}px`;
-      chatHold.style.height = `${state.chatH * fh}px`;
-      chatHold.style.left   = `${state.chatX * fw - (state.chatW * fw) / 2}px`;
-      chatHold.style.top    = `${state.chatY * fh - (state.chatH * fh) / 2}px`;
+    // ── 8. Chat position + size, then visibility ─────────────────────────────
+    if (state.chatW) {
+      const fw       = document.querySelector('.clip_canvas')?.clientWidth  ?? 1;
+      const fh       = document.querySelector('.clip_canvas')?.clientHeight ?? 1;
+      const chatHold = document.querySelector('.chat_hold');
+      if (chatHold) {
+        chatHold.style.width  = `${state.chatW * fw}px`;
+        chatHold.style.height = `${state.chatH * fh}px`;
+        chatHold.style.left   = `${state.chatX * fw - (state.chatW * fw) / 2}px`;
+        chatHold.style.top    = `${state.chatY * fh - (state.chatH * fh) / 2}px`;
+      }
     }
-  }
-  if (state.chatVisible !== undefined) api.setChatVisible(state.chatVisible);
+    if (state.chatVisible !== undefined) api.setChatVisible(state.chatVisible);
   });
 }
 
