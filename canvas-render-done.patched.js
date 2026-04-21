@@ -147,9 +147,9 @@
   async function ensureMp4Support() {
     if (_canMP4 !== null) return _canMP4;
     if (typeof VideoEncoder === 'undefined') { _canMP4 = false; return false; }
-    // Do not require AudioEncoder here. Safari exposes it; Chrome on iOS often does not,
-    // but VideoEncoder + Mediabunny can still mux MP4 (video-only AAC path skipped below).
-    // Requiring AudioEncoder forced a broken MediaRecorder MP4 path on Chrome iOS (empty blob).
+    // Do not require AudioEncoder to *enable* MP4: Safari has it (buffered AAC); Chrome iOS does not
+    // (video-only H.264 — live MediaElement AAC makes Mediabunny output.start() hang past the timeout).
+    // Requiring AudioEncoder for MP4 entirely forced broken MediaRecorder MP4 on Chrome iOS (empty blob).
     try {
       _mb = await import('https://esm.sh/mediabunny@1');
       _canMP4 = await _mb.canEncode('avc');
@@ -158,7 +158,7 @@
     }
     if (_canMP4) {
       if (_useBufferedMp4Audio && typeof AudioEncoder === 'undefined') {
-        console.log('Render: MP4 output enabled (H.264); AudioEncoder missing — will try live element audio after play');
+        console.log('Render: MP4 output enabled (H.264 video-only); no AudioEncoder on this browser (e.g. Chrome iOS)');
       } else {
         console.log('Render: MP4 output enabled (H.264 + AAC)');
       }
@@ -564,28 +564,25 @@
           });
           return;
         }
-        if (_useBufferedMp4Audio && typeof AudioEncoder === 'undefined') {
-          console.warn('Render: AudioEncoder unavailable — live MediaElement audio for AAC (Chrome iOS)');
+        if (_useBufferedMp4Audio) {
+          console.warn('Render: AudioEncoder unavailable — MP4 video-only (live AAC hangs output.start here)');
+          return;
         }
-        try {
-          rv.muted = false;
-          rv.volume = 1;
-          const src = audioCtx.createMediaElementSource(rv);
-          const dest = audioCtx.createMediaStreamDestination();
-          src.connect(dest);
-          const audioTrack = dest.stream.getAudioTracks()[0];
-          if (!audioTrack) {
-            console.warn('Render: MP4 audio track unavailable, exporting video-only');
-            return;
-          }
-          audioSource = new MediaStreamAudioTrackSource(audioTrack, {
-            codec: 'aac',
-            bitrate: 128_000,
-          });
-          audioSource.errorPromise.catch(e => console.warn('Render: audio source error', e));
-        } catch (e) {
-          console.warn('Render: live element MP4 audio failed, exporting video-only', e);
+        rv.muted = false;
+        rv.volume = 1;
+        const src = audioCtx.createMediaElementSource(rv);
+        const dest = audioCtx.createMediaStreamDestination();
+        src.connect(dest);
+        const audioTrack = dest.stream.getAudioTracks()[0];
+        if (!audioTrack) {
+          console.warn('Render: MP4 audio track unavailable, exporting video-only');
+          return;
         }
+        audioSource = new MediaStreamAudioTrackSource(audioTrack, {
+          codec: 'aac',
+          bitrate: 128_000,
+        });
+        audioSource.errorPromise.catch(e => console.warn('Render: audio source error', e));
       };
 
       if (_useBufferedMp4Audio && typeof AudioEncoder !== 'undefined') {
