@@ -28,6 +28,15 @@
     autoOffRatio: 0.85, // if the subject is lost for ≥ this fraction → tracking toggles OFF (failed seed)
     // pure detection-link fallback (forceMode:'faceonly'):
     gate: 0.18, maxGate: 0.33, slack: 0.8, seedWin: 1.0, sizeW: 1.2,
+    // ── Human detector (pose backbone + face-embedding identity) — the new default ──
+    detector:      'human',   // 'human' (pose + re-ID) | 'legacy' (patch + BlazeFace)
+    humanSrc:      'https://cdn.jsdelivr.net/npm/@vladmandic/human/dist/human.esm.js',
+    humanModels:   'https://cdn.jsdelivr.net/npm/@vladmandic/human/models/',
+    humanFps:      5,         // analyze sample rate for the human path (heavier per-frame than legacy)
+    humanLongSide: 640,       // detection input resolution (longest side, px)
+    humanGate:     0.12,      // max per-frame head jump (norm) before a re-ID match is required
+    reidMatch:     0.50,      // face-embedding cosine ≥ this locks/re-acquires the identity
+    coastSec:      0.6,       // hold through a gap this long before marking the track lost
   };
   window.wcTrackCfg = TRACK;
 
@@ -770,7 +779,165 @@
     const track = mode === 'face' ? _snapToFaces(backbone, perFrame, snapR) : backbone;
     return { track, mode };
   }
+  // ── Human tracker: pose backbone (≈100% coverage) + face-embedding IDENTITY ──
+  // Ported from tracker-lab.html. Identity-first association (pick the face whose embedding matches
+  // the seed, NOT the nearest person) → coherent single-subject tracking; coasts rather than hopping
+  // to a stranger. Output {t,cx,cy,w,lost?} is the same shape the reframe sampler/lane already read.
+  let _human = null, _humanP = null;
+  function ensureHuman() {
+    if (_humanP) return _humanP;
+    _humanP = (async () => {
+      const mod = await import(TRACK.humanSrc);
+      const Human = mod.default || mod.Human;
+      const h = new Human({
+        backend: 'webgl', modelBasePath: TRACK.humanModels, filter: { enabled: false },
+        face: { enabled: true, detector: { rotation: false, return: true, maxDetected: 8 }, mesh: { enabled: false }, iris: { enabled: false }, description: { enabled: true }, emotion: { enabled: false } },
+        body: { enabled: true, maxDetected: 8 }, hand: { enabled: false }, gesture: { enabled: false }, object: { enabled: false }, segmentation: { enabled: false },
+      });
+      await h.load(); await h.warmup(); _human = h;
+      log('human tracker ready —', h.version);
+      return h;
+    })().catch(e => { _humanP = null; throw e; });
+    return _humanP;
+  }
+  function _cosSimT(a, b) { if (!a || !b) return 0; let d=0,na=0,nb=0; for (let i=0;i<a.length;i++){ d+=a[i]*b[i]; na+=a[i]*a[i]; nb+=b[i]*b[i]; } return d/(Math.sqrt(na*nb)||1); }
+  // One detected person, normalised 0..1: head point (framing) + size + optional face embedding.
+  function _personsFromHuman(res) {
+    const out = [];
+    for (const b of (res.body || [])) {
+      const kp = b.keypoints || [];
+      const nose = kp.find(k => k.part === 'nose');
+      const lsh = kp.find(k => k.part === 'leftShoulder'), rsh = kp.find(k => k.part === 'rightShoulder');
+      const head = nose?.positionRaw || (b.boxRaw ? [b.boxRaw[0]+b.boxRaw[2]/2, b.boxRaw[1]+b.boxRaw[3]*0.15] : null);
+      if (!head) continue;
+      let size = b.boxRaw ? b.boxRaw[2] : 0.2;
+      if (lsh?.positionRaw && rsh?.positionRaw) size = Math.max(size, Math.hypot(lsh.positionRaw[0]-rsh.positionRaw[0], lsh.positionRaw[1]-rsh.positionRaw[1])*1.6);
+      out.push({ cx: head[0], cy: head[1], size, emb: null });
+    }
+    for (const f of (res.face || [])) {           // attach nearest face embedding → identity, and use the face centre for framing
+      if (!f.embedding || !f.boxRaw) continue;
+      const fx = f.boxRaw[0]+f.boxRaw[2]/2, fy = f.boxRaw[1]+f.boxRaw[3]/2;
+      let best = null, bd = 0.25;
+      for (const p of out) { const d = Math.hypot(p.cx-fx, p.cy-fy); if (d < bd) { bd = d; best = p; } }
+      if (best) { best.emb = f.embedding; best.cx = fx; best.cy = fy - f.boxRaw[3]*0.1; }
+      else out.push({ cx: fx, cy: fy, size: f.boxRaw[2], emb: f.embedding });
+    }
+    return out;
+  }
+  function _buildTrackHuman(perFrame, seed, opt) {
+    const { gate, reidMatch, coastSec, fps } = opt;
+    if (!perFrame.length) return [];
+    let aIdx = 0, ab = Infinity;
+    for (let i=0;i<perFrame.length;i++){ const d=Math.abs(perFrame[i].t-seed.t); if(d<ab){ab=d;aIdx=i;} }
+    let anchor = null, abest = Infinity;
+    for (const p of perFrame[aIdx].people){ const d=Math.hypot(p.cx-seed.x,p.cy-seed.y); if(d<abest){abest=d;anchor=p;} }
+    if (!anchor) return [];
+    let idEmb = anchor.emb ? anchor.emb.slice() : null;     // STABLE identity (no drift) → coherence
+    for (let k=1;k<=3 && !idEmb;k++) for (const j of [aIdx+k, aIdx-k]) {
+      const pf2 = perFrame[j]; if (!pf2) continue;
+      let best=null, bd=0.15;
+      for (const p of pf2.people){ if(!p.emb) continue; const d=Math.hypot(p.cx-seed.x,p.cy-seed.y); if(d<bd){bd=d;best=p;} }
+      if (best){ idEmb=best.emb.slice(); break; }
+    }
+    const out = new Array(perFrame.length);
+    const choose = (people, prev, lostFor) => {       // identity-first
+      let idPick=null, idSim=-1;
+      if (idEmb) for (const p of people){ if(!p.emb) continue; const s=_cosSimT(idEmb,p.emb); if(s>idSim){idSim=s;idPick=p;} }
+      let mPick=null, md=Infinity;
+      for (const p of people){ const d=Math.hypot(p.cx-prev.cx,p.cy-prev.cy); if(d<md){md=d;mPick=p;} }
+      const reach = gate + 0.05*lostFor;
+      if (idPick && idSim >= reidMatch) return idPick;                       // strong identity match anywhere
+      if (idPick && idPick===mPick && md <= reach) return idPick;            // position + identity agree
+      const conflicting = idEmb && people.some(p=>p.emb);
+      if (mPick && md <= reach && !(conflicting && mPick.emb)) return mPick;  // motion only when no identified face conflicts
+      return null;
+    };
+    const walk = (from,to,dir) => {
+      let prev = { cx:anchor.cx, cy:anchor.cy }, lostFor=0;
+      for (let i=from; dir>0?i<=to:i>=to; i+=dir){
+        const pf=perFrame[i], dt=Math.abs(pf.t-perFrame[i-dir].t);
+        const pick = choose(pf.people, prev, lostFor);
+        if (pick){ prev={cx:pick.cx,cy:pick.cy}; lostFor=0; out[i]={ t:pf.t, cx:pick.cx, cy:pick.cy, w:pick.size }; }
+        else { lostFor += dt || (1/Math.max(1,fps)); out[i]={ t:pf.t, cx:prev.cx, cy:prev.cy, w:anchor.size, lost: lostFor>=coastSec }; }
+      }
+    };
+    out[aIdx] = { t: perFrame[aIdx].t, cx: anchor.cx, cy: anchor.cy, w: anchor.size };
+    walk(aIdx+1, perFrame.length-1, 1);
+    walk(aIdx-1, 0, -1);
+    return out;
+  }
+  async function _analyzeHuman(opts) {
+    const { sx=0.5, sy=0.5, atSec=null, onProgress } = opts;
+    const gen = ++_analyzeGen;
+    const media = state.media;
+    if (!media?.samples?.length) throw new Error('engine not active (no demuxed media)');
+    const { samples, keyIdx, config } = media;
+    const H = await ensureHuman();
+    const win = window.canvasAPI?.getSourceWindow?.();
+    const t0 = win ? win.start : samples[0].ts/1e6;
+    const t1 = win ? win.end   : samples[samples.length-1].ts/1e6;
+    const fps = TRACK.humanFps, period = 1/Math.max(1,fps);
+    const fw = config.codedWidth, fh = config.codedHeight;
+    const scl = TRACK.humanLongSide/Math.max(fw,fh);
+    const cw = Math.max(1,Math.round(fw*scl)), ch = Math.max(1,Math.round(fh*scl));
+    const cnv = document.createElement('canvas'); cnv.width=cw; cnv.height=ch;
+    const c2d = cnv.getContext('2d');
+    const perFrame = [];
+    let nextT = t0, pending = 0, chain = Promise.resolve();
+    const dec = new VideoDecoder({
+      output: (f) => {
+        const ts = f.timestamp/1e6;
+        if (ts < nextT - 1e-3 || ts > t1 + 0.25) { f.close(); return; }
+        nextT = Math.max(nextT + period, ts + period*0.5);
+        c2d.drawImage(f, 0, 0, cw, ch); f.close();
+        const snap = document.createElement('canvas'); snap.width=cw; snap.height=ch;   // race-free frame snapshot
+        snap.getContext('2d').drawImage(cnv, 0, 0);
+        pending++;
+        chain = chain.then(async () => {
+          let res=null; try { res = await H.detect(snap); } catch(_){}
+          perFrame.push({ t: ts, people: res ? _personsFromHuman(res) : [] });
+          pending--;
+          if (onProgress) try { onProgress(Math.min(1,(ts-t0)/Math.max(0.001,t1-t0))); } catch(_){}
+        });
+      },
+      error: (e) => console.warn('[wc] human tracker decode', e),
+    });
+    dec.configure(config);
+    let startKf = keyIdx[0];
+    for (const i of keyIdx) { if (samples[i].ts/1e6 <= t0) startKf=i; else break; }
+    for (let i=startKf;i<samples.length;i++){
+      const s = samples[i];
+      if (s.ts/1e6 > t1 + 0.3) break;
+      if (dec.decodeQueueSize > 16) await new Promise(r=>setTimeout(r,0));
+      while (pending > 10) await new Promise(r=>setTimeout(r,4));    // backpressure: cap in-flight detections
+      dec.decode(new EncodedVideoChunk({ type:s.type, timestamp:s.ts, duration:s.dur, data:s.data }));
+    }
+    await dec.flush(); try { dec.close(); } catch(_){}
+    await chain;                                                     // drain remaining detections
+    if (gen !== _analyzeGen) return { frames: perFrame.length, detected:0, points:0, mode:null, enabled:false, superseded:true, t0, t1 };
+    perFrame.sort((a,b)=>a.t-b.t);
+    _lastScan = { perFrame, gw: cw, gh: ch, t0, t1, human:true };
+    const track = _buildTrackHuman(perFrame, { x:sx, y:sy, t: atSec ?? t0 }, { gate: TRACK.humanGate, reidMatch: TRACK.reidMatch, coastSec: TRACK.coastSec, fps });
+    const lostCount = track.reduce((n,p)=>n+(p&&p.lost?1:0),0);
+    const lostRatio = track.length ? lostCount/track.length : 1;
+    const autoOff = lostRatio >= TRACK.autoOffRatio;
+    if (track.length) {
+      const payload = { enabled: !autoOff, seed: { sx, sy, atSec: atSec ?? t0 }, raw: track, mode: 'face' };
+      if (window.canvasAPI?.commitTracking) window.canvasAPI.commitTracking(payload);
+      else if (window.wcReframe) { window.wcReframe.seed=payload.seed; window.wcReframe.mode='face'; window.wcReframe.setTrack(track); window.wcReframe.enable(!autoOff); }
+    }
+    const N = Math.max(1, perFrame.length);
+    const withPose = perFrame.filter(p=>p.people.length).length;
+    const withFace = perFrame.filter(p=>p.people.some(q=>q.emb)).length;
+    log(`tracker[human]: ${perFrame.length} frames, pose ${(withPose/N*100)|0}% face ${(withFace/N*100)|0}%, track ${track.length} pts, lost ${(lostRatio*100)|0}%${autoOff?' → no subject, OFF':''} (${t0.toFixed(1)}–${t1.toFixed(1)}s)`);
+    return { frames: perFrame.length, detected: withFace, points: track.length, mode:'face', lostRatio, enabled:!autoOff, t0, t1 };
+  }
+
   async function analyzeFaceTrack(opts = {}) {
+    if (TRACK.detector === 'human') {
+      try { return await _analyzeHuman(opts); }
+      catch (e) { console.warn('[wc] human tracker failed → legacy fallback:', e); }
+    }
     const { sx = 0.5, sy = 0.5, atSec = null, fps = TRACK.fps, gate = TRACK.gate,
             maxGate = TRACK.maxGate, slack = TRACK.slack, seedWin = TRACK.seedWin, sizeW = TRACK.sizeW,
             conf = TRACK.conf, longSide = TRACK.longSide, enhance = TRACK.enhance,
@@ -916,7 +1083,9 @@
       let t = 0; try { t = state.engine.currentSourceTime(); } catch (_) {}
       const fr = nearest(t);
       _boxWrap.innerHTML = '';
-      if (fr) for (const d of fr.dets) {
+      // human scans store `.people` ({cx,cy,size}) instead of `.dets` ({cx,cy,w,h}) — adapt to boxes
+      const boxes = fr ? (fr.dets || (fr.people || []).map(p => ({ cx:p.cx, cy:p.cy, w:p.size||0.12, h:p.size||0.12 }))) : [];
+      if (boxes) for (const d of boxes) {
         const b = document.createElement('div');
         Object.assign(b.style, {
           position: 'absolute',
