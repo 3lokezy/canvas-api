@@ -6,6 +6,10 @@
   const VERSION = 'v2.7-storyboard';
   window.__aiDirectorVersion = VERSION;
   console.log('[ai-polish] director', VERSION);
+  // Pipeline stage trace — one loud line per stage so a broken flow shows exactly where it stopped:
+  // ①scan ②digest-stashed ③request-out ④response-in ⑤validate/compile ⑥applied
+  const stage = (n, msg, ...d) => console.log('%c[ai-polish] ' + n + ' ' + msg, 'color:#7c4dff;font-weight:bold', ...d);
+  const kb = x => { try { return Math.round(JSON.stringify(x).length / 1024) + 'KB'; } catch (_) { return '?KB'; } };
 
   // ── AUTONOMOUS AI EDITOR ("AI Polish") ────────────────────────────────────────
   // Premium LLM editor that OWNS the whole edit. Sends a digest (content + on-screen scan + constraints)
@@ -687,10 +691,13 @@
     }).filter(Boolean);
   }
   async function buildDigest() {
-    if (!api()) return null;
+    if (!api()) { console.warn('[ai-polish] buildDigest: canvasAPI not ready'); return null; }
+    stage('①', 'client scan starting (fps ' + CFG.SCAN_FPS + ', res ' + CFG.SCAN_RES + ', thumbs ' + CFG.THUMB_SIDE + 'px)…');
     // The browser scan still runs for what the GRAPH doesn't carry: the multimodal gap FRAMES (jpeg thumbs)
     // + audio/motion gap signals. Everything identity/position/shot/speaker shaped prefers the graph.
     const scanSegs = await scan();                                  // also ensures window._scan (with thumbs) exists
+    stage('①', 'scan done: ' + ((window._scan && window._scan.perFrame) || []).length + ' frames, graph ' +
+          (sceneGraph() ? 'LOADED (' + (sceneGraph().persons || []).length + ' persons)' : 'MISSING — scan-only fallback'));
     const gScan    = graphScanDigest();                             // typed shots from the sidecar (authoritative)
     const dur      = sourceDuration();
     const off      = api()?.getSourceWindow?.()?.start || 0;
@@ -713,6 +720,10 @@
       for (const s of scanSegs) if ((s.type === 'OVERLAY_CAM' || s.type === 'DUO_OVERLAY') && !s.face) s.face = camFace;
     }
     _lastGaps = gaps;
+    stage('②', 'digest built: ' + tr.length + ' lines, ' + gaps.length + ' gaps (' +
+          gaps.filter(g => g.verdict === 'keep_hint').length + ' keep_hint), ' + (peaks || []).length + ' peaks, ' +
+          fr.frames.length + ' hotspot frames, storyboard ' + (sb ? sb.cells.length + ' cells' : 'NONE') +
+          ', facecam ' + (camB ? 'YES' : 'no'));
     return {
       facecam:         camB ? { cx: camC.cx, cy: camC.cy, edge: +Math.min(camC.cx, 1 - camC.cx, camC.cy, 1 - camC.cy).toFixed(3), box: camB } : null,
       clip_id:         wzText('stream_clip_id') || null,
@@ -868,6 +879,10 @@
         if (!segments.some(s => mid >= s.from && mid <= s.to)) console.warn('[ai-polish] AUDIT: keep_hint gap was cut', g);
       }
     } catch (_) {}
+    const _inN = Array.isArray(plan?.segments) ? plan.segments.length : 0;
+    if (_inN && segments.length < _inN)
+      console.warn('[ai-polish] validate: dropped ' + (_inN - segments.length) + ' of ' + _inN +
+                   ' segments (< MIN_SEG ' + CFG.MIN_SEG + 's, bad numbers, or disallowed mode)');
     return { segments, title: typeof plan?.title === 'string' ? plan.title.trim() : '' };
   }
 
@@ -1420,7 +1435,12 @@
   // and the deterministic grammar compiles HOW: beats, framing, tracking, overlap guards. The model never
   // writes zoom/focus numbers, so every shot is geometrically legal by construction.
   function applyIntents(plan) {
+    stage('④', 'response handed to applyIntents (' + kb(plan) + ')');
     const p = coercePlan(plan);
+    if (!p || typeof p !== 'object') { console.warn('[ai-polish] ⑤ FAILED: response did not coerce to a plan object', plan); return; }
+    if (p.error) { console.warn('[ai-polish] ⑤ FAILED: n8n returned an error payload', p); return; }
+    stage('⑤', 'validating: keys [' + Object.keys(p).join(', ') + ']' +
+          (p.analysis ? ' — analysis: "' + String(p.analysis).slice(0, 160) + '…"' : ' — NO analysis field'));
     const FEATURES_OK = new Set(['reaction', 'punch', 'wide', 'letterbox', 'split']);
     const sp2p = (sceneGraph() && sceneGraph().speakers) || {};       // the model speaks in transcript letters (A/B)
     const keep = (Array.isArray(p?.segments) ? p.segments : []).map(s => {
@@ -1428,7 +1448,9 @@
       if (who && sp2p[who]) who = sp2p[who];                          // speaker letter → graph person id
       return { from: +s.from, to: +s.to, feature: FEATURES_OK.has(s.feature) ? s.feature : null, person: who };
     }).filter(s => Number.isFinite(s.from) && Number.isFinite(s.to) && s.to > s.from);
-    if (!keep.length) { console.warn('[ai-polish] intents: no valid kept ranges — falling back to full auto'); return applyPlan(generatePlan()); }
+    if (!keep.length) { console.warn('[ai-polish] ⑤ no valid kept ranges in response — falling back to full auto edit'); return applyPlan(generatePlan()); }
+    keep.forEach((k, i) => stage('⑤', 'range ' + (i + 1) + '/' + keep.length + ': ' + k.from.toFixed(1) + '–' + k.to.toFixed(1) + 's' +
+      (k.feature ? ' [' + k.feature + (k.person ? ' ' + k.person : '') + ']' : ' [default grammar]')));
     const det = generatePlan({ keep });
     if (typeof p.title === 'string' && p.title.trim()) det.title = p.title.trim();
     // feature sections (music/sfx/images/text styling) ride the plan into applyFeatures unchanged
@@ -1460,17 +1482,37 @@
       };
       resolve(det.sfx, 'at'); resolve(det.images, 'range');
     } catch (_) {}
-    console.log('[ai-polish] intents: ' + keep.length + ' kept ranges (' +
-      keep.filter(k => k.feature).map(k => k.feature).join(',') + ') → ' + (det.segments || []).length + ' beats');
-    return applyPlan(det);
+    const keptDur = keep.reduce((a, k) => a + (k.to - k.from), 0);
+    const beatDur = (det.segments || []).reduce((a, s) => a + (s.to - s.from), 0);
+    stage('⑤', 'compiled: ' + keep.length + ' kept ranges (' + keptDur.toFixed(1) + 's) → ' + (det.segments || []).length +
+          ' beats (' + beatDur.toFixed(1) + 's)' + (Math.abs(keptDur - beatDur) > 1.5 ? ' ⚠ durations diverge — check MIN_SEG drops above' : ''));
+    const res = applyPlan(det);
+    // ⑥ CONFORMANCE — did what LANDED match what was returned?
+    try {
+      const applied = (res && res.segments) || [];
+      const appliedDur = applied.reduce((a, s) => a + (s.to - s.from), 0);
+      const modes = {};
+      for (const s of applied) { const m = s.letterbox ? 'letterbox' : s.mode; modes[m] = (modes[m] || 0) + 1; }
+      stage('⑥', 'APPLIED: ' + applied.length + ' clips, output ' + appliedDur.toFixed(1) + 's of ' + keptDur.toFixed(1) + 's kept — ' +
+            Object.entries(modes).map(([k2, v2]) => k2 + '×' + v2).join(', ') +
+            (det.title ? ' — title: "' + det.title + '"' : '') +
+            ((det.sfx || []).length ? ' — sfx×' + det.sfx.length : '') +
+            ((det.images || []).length ? ' — images×' + det.images.length : ''));
+      if (!applied.length) console.warn('[ai-polish] ⑥ NOTHING APPLIED — every beat was dropped in validate (check MIN_SEG / mode constraints)');
+    } catch (_) {}
+    return res;
   }
 
   // ── webhook (client-driven path) ───────────────────────────────────────────────
   async function fetchPlan(digest) {
     if (!CFG.url) throw new Error('set window.aiDirectorCfg.url to your n8n webhook');
+    stage('③', 'POST → ' + CFG.url + ' (' + kb(digest) + ')');
+    const t0 = performance.now();
     const res = await fetch(CFG.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(digest) });
     if (!res.ok) throw new Error('webhook ' + res.status);
-    const plan = coercePlan(await res.json());
+    const raw = await res.json();
+    stage('④', 'response received in ' + ((performance.now() - t0) / 1000).toFixed(1) + 's (' + kb(raw) + ')');
+    const plan = coercePlan(raw);
     if (!plan.segments) throw new Error('unrecognised webhook response');
     return plan;
   }
@@ -1487,7 +1529,12 @@
   //      window.__aiDigest; it also RETURNS it, so a Wized JS action can `return` it into a variable.
   //   2) your Wized "perform request" sends that stash/variable as the body (the scan is inside it).
   //   3) on success, `window.aiPolish.apply(<response plan>)` rebuilds the clip.
-  window.aiPolish.digest   = async () => { const d = await buildDigest(); window.__aiDigest = d; return d; };
+  window.aiPolish.digest   = async () => {
+    const d = await buildDigest();
+    window.__aiDigest = d;
+    if (d) stage('②', 'digest stashed to window.__aiDigest (' + kb(d) + ') — send it via the webhook now (③ is your Wized request)');
+    return d;
+  };
   window.aiPolish.apply    = (plan) => applyPlan(coercePlan(plan));  // apply the webhook response (parsed plan OR raw Gemini envelope)
   window.aiPolish.dryRun   = (plan) => applyPlan(coercePlan(plan));  // apply a hand-pasted plan to test
   window.aiPolish.validate = (plan) => validate(plan);
